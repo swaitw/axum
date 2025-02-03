@@ -7,19 +7,22 @@
 //! ```
 
 use axum::{
-    async_trait,
-    extract::{FromRequest, RequestParts, TypedHeader},
-    http::StatusCode,
+    extract::FromRequestParts,
+    http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Json, RequestPartsExt, Router,
 };
-use headers::{authorization::Bearer, Authorization};
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
+};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{fmt::Display, net::SocketAddr};
+use std::fmt::Display;
+use std::sync::LazyLock;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Quick instructions
 //
@@ -47,37 +50,36 @@ use std::{fmt::Display, net::SocketAddr};
 //     -H 'Authorization: Bearer blahblahblah' \
 //     http://localhost:3000/protected
 
-static KEYS: Lazy<Keys> = Lazy::new(|| {
+static KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     Keys::new(secret.as_bytes())
 });
 
 #[tokio::main]
 async fn main() {
-    // Set the RUST_LOG, if it hasn't been explicitly defined
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "example_jwt=debug")
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     let app = Router::new()
         .route("/protected", get(protected))
         .route("/authorize", post(authorize));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
-
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn protected(claims: Claims) -> Result<String, AuthError> {
     // Send the protected data to the user
     Ok(format!(
-        "Welcome to the protected area :)\nYour data:\n{}",
-        claims
+        "Welcome to the protected area :)\nYour data:\n{claims}",
     ))
 }
 
@@ -93,7 +95,8 @@ async fn authorize(Json(payload): Json<AuthPayload>) -> Result<Json<AuthBody>, A
     let claims = Claims {
         sub: "b@b.com".to_owned(),
         company: "ACME".to_owned(),
-        exp: 10000000000,
+        // Mandatory expiry time as UTC timestamp
+        exp: 2000000000, // May 2033
     };
     // Create the authorization token
     let token = encode(&Header::default(), &claims, &KEYS.encoding)
@@ -118,19 +121,18 @@ impl AuthBody {
     }
 }
 
-#[async_trait]
-impl<B> FromRequest<B> for Claims
+impl<S> FromRequestParts<S> for Claims
 where
-    B: Send,
+    S: Send + Sync,
 {
     type Rejection = AuthError;
 
-    async fn from_request(req: &mut RequestParts<B>) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         // Extract the token from the authorization header
-        let TypedHeader(Authorization(bearer)) =
-            TypedHeader::<Authorization<Bearer>>::from_request(req)
-                .await
-                .map_err(|_| AuthError::InvalidToken)?;
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|_| AuthError::InvalidToken)?;
         // Decode the user data
         let token_data = decode::<Claims>(bearer.token(), &KEYS.decoding, &Validation::default())
             .map_err(|_| AuthError::InvalidToken)?;
@@ -154,17 +156,16 @@ impl IntoResponse for AuthError {
     }
 }
 
-#[derive(Debug)]
 struct Keys {
     encoding: EncodingKey,
-    decoding: DecodingKey<'static>,
+    decoding: DecodingKey,
 }
 
 impl Keys {
     fn new(secret: &[u8]) -> Self {
         Self {
             encoding: EncodingKey::from_secret(secret),
-            decoding: DecodingKey::from_secret(secret).into_static(),
+            decoding: DecodingKey::from_secret(secret),
         }
     }
 }

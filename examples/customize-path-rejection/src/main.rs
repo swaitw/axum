@@ -5,34 +5,34 @@
 //! ```
 
 use axum::{
-    async_trait,
-    extract::{path::ErrorKind, rejection::PathRejection, FromRequest, RequestParts},
-    http::StatusCode,
+    extract::{path::ErrorKind, rejection::PathRejection, FromRequestParts},
+    http::{request::Parts, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::net::SocketAddr;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    // Set the RUST_LOG, if it hasn't been explicitly defined
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "example_customize_path_rejection=debug")
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // build our application with a route
-    let app = Router::new().route("/users/:user_id/teams/:team_id", get(handler));
+    let app = Router::new().route("/users/{user_id}/teams/{team_id}", get(handler));
 
     // run it
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn handler(Path(params): Path<Params>) -> impl IntoResponse {
@@ -48,17 +48,16 @@ struct Params {
 // We define our own `Path` extractor that customizes the error from `axum::extract::Path`
 struct Path<T>(T);
 
-#[async_trait]
-impl<B, T> FromRequest<B> for Path<T>
+impl<S, T> FromRequestParts<S> for Path<T>
 where
     // these trait bounds are copied from `impl FromRequest for axum::extract::path::Path`
     T: DeserializeOwned + Send,
-    B: Send,
+    S: Send + Sync,
 {
     type Rejection = (StatusCode, axum::Json<PathError>);
 
-    async fn from_request(req: &mut RequestParts<B>) -> Result<Self, Self::Rejection> {
-        match axum::extract::Path::<T>::from_request(req).await {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
             Ok(value) => Ok(Self(value.0)),
             Err(rejection) => {
                 let (status, body) = match rejection {
@@ -108,7 +107,7 @@ where
                             },
 
                             _ => PathError {
-                                message: format!("Unhandled deserialization error: {}", kind),
+                                message: format!("Unhandled deserialization error: {kind}"),
                                 location: None,
                             },
                         };
@@ -125,7 +124,7 @@ where
                     _ => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         PathError {
-                            message: format!("Unhandled path rejection: {}", rejection),
+                            message: format!("Unhandled path rejection: {rejection}"),
                             location: None,
                         },
                     ),

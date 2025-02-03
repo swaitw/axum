@@ -10,37 +10,36 @@
 //! -> <h1>Hello, LT!</h1>
 //! ```
 
-use async_trait::async_trait;
 use axum::{
-    extract::{Form, FromRequest, RequestParts},
+    extract::{rejection::FormRejection, Form, FromRequest, Request},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
-    BoxError, Router,
+    Router,
 };
 use serde::{de::DeserializeOwned, Deserialize};
-use std::net::SocketAddr;
 use thiserror::Error;
+use tokio::net::TcpListener;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator::Validate;
 
 #[tokio::main]
 async fn main() {
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "example_validator=debug")
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // build our application with a route
     let app = Router::new().route("/", get(handler));
 
     // run it
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
-
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -56,18 +55,16 @@ async fn handler(ValidatedForm(input): ValidatedForm<NameInput>) -> Html<String>
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ValidatedForm<T>(pub T);
 
-#[async_trait]
-impl<T, B> FromRequest<B> for ValidatedForm<T>
+impl<T, S> FromRequest<S> for ValidatedForm<T>
 where
     T: DeserializeOwned + Validate,
-    B: http_body::Body + Send,
-    B::Data: Send,
-    B::Error: Into<BoxError>,
+    S: Send + Sync,
+    Form<T>: FromRequest<S, Rejection = FormRejection>,
 {
     type Rejection = ServerError;
 
-    async fn from_request(req: &mut RequestParts<B>) -> Result<Self, Self::Rejection> {
-        let Form(value) = Form::<T>::from_request(req).await?;
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Form(value) = Form::<T>::from_request(req, state).await?;
         value.validate()?;
         Ok(ValidatedForm(value))
     }
@@ -79,14 +76,14 @@ pub enum ServerError {
     ValidationError(#[from] validator::ValidationErrors),
 
     #[error(transparent)]
-    AxumFormRejection(#[from] axum::extract::rejection::FormRejection),
+    AxumFormRejection(#[from] FormRejection),
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         match self {
             ServerError::ValidationError(_) => {
-                let message = format!("Input validation error: [{}]", self).replace("\n", ", ");
+                let message = format!("Input validation error: [{self}]").replace('\n', ", ");
                 (StatusCode::BAD_REQUEST, message)
             }
             ServerError::AxumFormRejection(_) => (StatusCode::BAD_REQUEST, self.to_string()),

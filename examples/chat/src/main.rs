@@ -8,29 +8,40 @@
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Extension,
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+        State,
     },
     response::{Html, IntoResponse},
     routing::get,
-    AddExtensionLayer, Router,
+    Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::{
     collections::HashSet,
-    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Our shared state
 struct AppState {
+    // We require unique usernames. This tracks which usernames have been taken.
     user_set: Mutex<HashSet<String>>,
+    // Channel used to send messages to all connected clients.
     tx: broadcast::Sender<String>,
 }
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=trace", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Set up application state for use with with_state().
     let user_set = Mutex::new(HashSet::new());
     let (tx, _rx) = broadcast::channel(100);
 
@@ -39,35 +50,36 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/websocket", get(websocket_handler))
-        .layer(AddExtensionLayer::new(app_state));
+        .with_state(app_state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| websocket(socket, state))
 }
 
+// This function deals with a single websocket connection, i.e., a single
+// connected client / user, for which we will spawn two independent tasks (for
+// receiving / sending chat messages).
 async fn websocket(stream: WebSocket, state: Arc<AppState>) {
-    // By splitting we can send and receive at the same time.
+    // By splitting, we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
 
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();
-
     // Loop until a text message is found.
     while let Some(Ok(message)) = receiver.next().await {
         if let Message::Text(name) = message {
             // If username that is sent by client is not taken, fill username string.
-            check_username(&state, &mut username, &name);
+            check_username(&state, &mut username, name.as_str());
 
             // If not empty we want to quit the loop else we want to quit function.
             if !username.is_empty() {
@@ -75,7 +87,9 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
             } else {
                 // Only send our client that username is taken.
                 let _ = sender
-                    .send(Message::Text(String::from("Username already taken.")))
+                    .send(Message::Text(Utf8Bytes::from_static(
+                        "Username already taken.",
+                    )))
                     .await;
 
                 return;
@@ -83,46 +97,51 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Subscribe before sending joined message.
+    // We subscribe *before* sending the "joined" message, so that we will also
+    // display it to our client.
     let mut rx = state.tx.subscribe();
 
-    // Send joined message to all subscribers.
-    let msg = format!("{} joined.", username);
+    // Now send the "joined" message to all subscribers.
+    let msg = format!("{username} joined.");
+    tracing::debug!("{msg}");
     let _ = state.tx.send(msg);
 
-    // This task will receive broadcast messages and send text message to our client.
+    // Spawn the first task that will receive broadcast messages and send text
+    // messages over the websocket to our client.
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             // In any websocket error, break loop.
-            if sender.send(Message::Text(msg)).await.is_err() {
+            if sender.send(Message::text(msg)).await.is_err() {
                 break;
             }
         }
     });
 
-    // Clone things we want to pass to the receiving task.
+    // Clone things we want to pass (move) to the receiving task.
     let tx = state.tx.clone();
     let name = username.clone();
 
-    // This task will receive messages from client and send them to broadcast subscribers.
+    // Spawn a task that takes messages from the websocket, prepends the user
+    // name, and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             // Add username before message.
-            let _ = tx.send(format!("{}: {}", name, text));
+            let _ = tx.send(format!("{name}: {text}"));
         }
     });
 
-    // If any one of the tasks exit, abort the other.
+    // If any one of the tasks run to completion, we abort the other.
     tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
     };
 
-    // Send user left message.
-    let msg = format!("{} left.", username);
+    // Send "user left" message (similar to "joined" above).
+    let msg = format!("{username} left.");
+    tracing::debug!("{msg}");
     let _ = state.tx.send(msg);
 
-    // Remove username from map so new clients can take it.
+    // Remove username from map so new clients can take it again.
     state.user_set.lock().unwrap().remove(&username);
 }
 

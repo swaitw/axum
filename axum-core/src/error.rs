@@ -15,14 +15,9 @@ impl Error {
         }
     }
 
-    pub(crate) fn downcast<T>(self) -> Result<T, Self>
-    where
-        T: StdError + 'static,
-    {
-        match self.inner.downcast::<T>() {
-            Ok(t) => Ok(*t),
-            Err(err) => Err(*err.downcast().unwrap()),
-        }
+    /// Convert an `Error` back into the underlying boxed trait object.
+    pub fn into_inner(self) -> BoxError {
+        self.inner
     }
 }
 

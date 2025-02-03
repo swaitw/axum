@@ -31,6 +31,16 @@ It doesn't matter whether you return `Err(StatusCode::NOT_FOUND)` or
 `Err(StatusCode::INTERNAL_SERVER_ERROR)`. These are not considered errors in
 axum.
 
+Instead of a direct `StatusCode`, it makes sense to use intermediate error type
+that can ultimately be converted to `Response`. This allows using `?` operator
+in handlers. See those examples:
+
+* [`anyhow-error-response`][anyhow] for generic boxed errors
+* [`error-handling`][error-handling] for application-specific detailed errors
+
+[anyhow]: https://github.com/tokio-rs/axum/blob/main/examples/anyhow-error-response/src/main.rs
+[error-handling]: https://github.com/tokio-rs/axum/blob/main/examples/error-handling/src/main.rs
+
 This also applies to extractors. If an extractor doesn't match the request the
 request will be rejected and a response will be returned without calling your
 handler. See [`extract`](crate::extract) to learn more about handling extractor
@@ -62,7 +72,7 @@ let some_fallible_service = tower::service_fn(|_req| async {
     Ok::<_, anyhow::Error>(Response::new(Body::empty()))
 });
 
-let app = Router::new().route(
+let app = Router::new().route_service(
     "/",
     // we cannot route to `some_fallible_service` directly since it might fail.
     // we have to use `handle_error` which converts its errors into responses
@@ -75,12 +85,10 @@ let app = Router::new().route(
 async fn handle_anyhow_error(err: anyhow::Error) -> (StatusCode, String) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Something went wrong: {}", err),
+        format!("Something went wrong: {err}"),
     )
 }
-# async {
-# axum::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-# };
+# let _: Router = app;
 ```
 
 # Applying fallible middleware
@@ -118,13 +126,11 @@ async fn handle_timeout_error(err: BoxError) -> (StatusCode, String) {
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Unhandled internal error: {}", err),
+            format!("Unhandled internal error: {err}"),
         )
     }
 }
-# async {
-# axum::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-# };
+# let _: Router = app;
 ```
 
 # Running extractors for error handling
@@ -161,12 +167,10 @@ async fn handle_timeout_error(
 ) -> (StatusCode, String) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("`{} {}` failed with {}", method, uri, err),
+        format!("`{method} {uri}` failed with {err}"),
     )
 }
-# async {
-# axum::Server::bind(&"".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
-# };
+# let _: Router = app;
 ```
 
 [`tower::Service`]: `tower::Service`

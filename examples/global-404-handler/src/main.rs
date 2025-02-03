@@ -5,35 +5,35 @@
 //! ```
 
 use axum::{
-    handler::Handler,
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::get,
     Router,
 };
-use std::net::SocketAddr;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    // Set the RUST_LOG, if it hasn't been explicitly defined
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "example_global_404_handler=debug")
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // build our application with a route
     let app = Router::new().route("/", get(handler));
 
     // add a fallback service for handling routes to unknown paths
-    let app = app.fallback(handler_404.into_service());
+    let app = app.fallback(handler_404);
 
     // run it
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn handler() -> Html<&'static str> {

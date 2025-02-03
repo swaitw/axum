@@ -1,34 +1,57 @@
 //! Rejection response types.
 
-define_rejection! {
-    #[status = INTERNAL_SERVER_ERROR]
-    #[body = "Cannot have two request body extractors for a single handler"]
-    /// Rejection type used if you try and extract the request body more than
-    /// once.
-    pub struct BodyAlreadyExtracted;
+use crate::__composite_rejection as composite_rejection;
+use crate::__define_rejection as define_rejection;
+
+use crate::{BoxError, Error};
+
+composite_rejection! {
+    /// Rejection type for extractors that buffer the request body. Used if the
+    /// request body cannot be buffered due to an error.
+    pub enum FailedToBufferBody {
+        LengthLimitError,
+        UnknownBodyError,
+    }
+}
+
+impl FailedToBufferBody {
+    pub(crate) fn from_err<E>(err: E) -> Self
+    where
+        E: Into<BoxError>,
+    {
+        // two layers of boxes here because `with_limited_body`
+        // wraps the `http_body_util::Limited` in a `axum_core::Body`
+        // which also wraps the error type
+        let box_error = match err.into().downcast::<Error>() {
+            Ok(err) => err.into_inner(),
+            Err(err) => err,
+        };
+        let box_error = match box_error.downcast::<Error>() {
+            Ok(err) => err.into_inner(),
+            Err(err) => err,
+        };
+        match box_error.downcast::<http_body_util::LengthLimitError>() {
+            Ok(err) => Self::LengthLimitError(LengthLimitError::from_err(err)),
+            Err(err) => Self::UnknownBodyError(UnknownBodyError::from_err(err)),
+        }
+    }
 }
 
 define_rejection! {
-    #[status = INTERNAL_SERVER_ERROR]
-    #[body = "Headers taken by other extractor"]
-    /// Rejection used if the headers has been taken by another extractor.
-    pub struct HeadersAlreadyExtracted;
-}
-
-define_rejection! {
-    #[status = INTERNAL_SERVER_ERROR]
-    #[body = "Extensions taken by other extractor"]
-    /// Rejection used if the request extension has been taken by another
-    /// extractor.
-    pub struct ExtensionsAlreadyExtracted;
+    #[status = PAYLOAD_TOO_LARGE]
+    #[body = "Failed to buffer the request body"]
+    /// Encountered some other error when buffering the body.
+    ///
+    /// This can _only_ happen when you're using [`tower_http::limit::RequestBodyLimitLayer`] or
+    /// otherwise wrapping request bodies in [`http_body_util::Limited`].
+    pub struct LengthLimitError(Error);
 }
 
 define_rejection! {
     #[status = BAD_REQUEST]
     #[body = "Failed to buffer the request body"]
-    /// Rejection type for extractors that buffer the request body. Used if the
-    /// request body cannot be buffered due to an error.
-    pub struct FailedToBufferBody(Error);
+    /// Encountered an unknown error when buffering the body.
+    pub struct UnknownBodyError(Error);
 }
 
 define_rejection! {
@@ -40,25 +63,11 @@ define_rejection! {
 }
 
 composite_rejection! {
-    /// Rejection used for [`Request<_>`].
-    ///
-    /// Contains one variant for each way the [`Request<_>`] extractor can fail.
-    ///
-    /// [`Request<_>`]: http::Request
-    pub enum RequestAlreadyExtracted {
-        BodyAlreadyExtracted,
-        HeadersAlreadyExtracted,
-        ExtensionsAlreadyExtracted,
-    }
-}
-
-composite_rejection! {
     /// Rejection used for [`Bytes`](bytes::Bytes).
     ///
     /// Contains one variant for each way the [`Bytes`](bytes::Bytes) extractor
     /// can fail.
     pub enum BytesRejection {
-        BodyAlreadyExtracted,
         FailedToBufferBody,
     }
 }
@@ -68,18 +77,7 @@ composite_rejection! {
     ///
     /// Contains one variant for each way the [`String`] extractor can fail.
     pub enum StringRejection {
-        BodyAlreadyExtracted,
         FailedToBufferBody,
         InvalidUtf8,
-    }
-}
-
-composite_rejection! {
-    /// Rejection used for [`http::request::Parts`].
-    ///
-    /// Contains one variant for each way the [`http::request::Parts`] extractor can fail.
-    pub enum RequestPartsAlreadyExtracted {
-        HeadersAlreadyExtracted,
-        ExtensionsAlreadyExtracted,
     }
 }

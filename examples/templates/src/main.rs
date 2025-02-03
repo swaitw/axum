@@ -6,33 +6,33 @@
 
 use askama::Template;
 use axum::{
-    body::{self, Full},
     extract,
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
-use std::net::SocketAddr;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    // Set the RUST_LOG, if it hasn't been explicitly defined
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "example_templates=debug")
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // build our application with some routes
-    let app = Router::new().route("/greet/:name", get(greet));
+    let app = Router::new().route("/greet/{name}", get(greet));
 
     // run it
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn greet(extract::Path(name): extract::Path<String>) -> impl IntoResponse {
@@ -55,13 +55,11 @@ where
     fn into_response(self) -> Response {
         match self.0.render() {
             Ok(html) => Html(html).into_response(),
-            Err(err) => Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(body::boxed(Full::from(format!(
-                    "Failed to render template. Error: {}",
-                    err
-                ))))
-                .unwrap(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to render template. Error: {err}"),
+            )
+                .into_response(),
         }
     }
 }

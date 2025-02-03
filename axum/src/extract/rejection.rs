@@ -1,14 +1,22 @@
 //! Rejection response types.
 
-use crate::{
-    body::boxed,
-    response::{IntoResponse, Response},
-    BoxError, Error,
-};
-use http_body::Full;
+use axum_core::__composite_rejection as composite_rejection;
+use axum_core::__define_rejection as define_rejection;
 
-pub use crate::extract::path::FailedToDeserializePathParams;
+pub use crate::extract::path::{FailedToDeserializePathParams, InvalidUtf8InPathParam};
 pub use axum_core::extract::rejection::*;
+
+#[cfg(feature = "json")]
+define_rejection! {
+    #[status = UNPROCESSABLE_ENTITY]
+    #[body = "Failed to deserialize the JSON body into the target type"]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    /// Rejection type for [`Json`](super::Json).
+    ///
+    /// This rejection is used if the request body is syntactically valid JSON but couldn't be
+    /// deserialized into the target type.
+    pub struct JsonDataError(Error);
+}
 
 #[cfg(feature = "json")]
 define_rejection! {
@@ -16,12 +24,16 @@ define_rejection! {
     #[body = "Failed to parse the request body as JSON"]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     /// Rejection type for [`Json`](super::Json).
-    pub struct InvalidJsonBody(Error);
+    ///
+    /// This rejection is used if the request body didn't contain syntactically valid JSON.
+    pub struct JsonSyntaxError(Error);
 }
 
+#[cfg(feature = "json")]
 define_rejection! {
-    #[status = BAD_REQUEST]
+    #[status = UNSUPPORTED_MEDIA_TYPE]
     #[body = "Expected request with `Content-Type: application/json`"]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     /// Rejection type for [`Json`](super::Json) used if the `Content-Type`
     /// header is missing.
     pub struct MissingJsonContentType;
@@ -36,75 +48,46 @@ define_rejection! {
 }
 
 define_rejection! {
-    #[status = PAYLOAD_TOO_LARGE]
-    #[body = "Request payload is too large"]
-    /// Rejection type for [`ContentLengthLimit`](super::ContentLengthLimit) if
-    /// the request body is too large.
-    pub struct PayloadTooLarge;
-}
-
-define_rejection! {
-    #[status = LENGTH_REQUIRED]
-    #[body = "Content length header is required"]
-    /// Rejection type for [`ContentLengthLimit`](super::ContentLengthLimit) if
-    /// the request is missing the `Content-Length` header or it is invalid.
-    pub struct LengthRequired;
-}
-
-define_rejection! {
     #[status = INTERNAL_SERVER_ERROR]
-    #[body = "No paths parameters found for matched route. This is a bug in axum. Please open an issue"]
-    /// Rejection type used if axum's internal representation of path parameters is missing. This
-    /// should never happen and is a bug in axum if it does.
+    #[body = "No paths parameters found for matched route"]
+    /// Rejection type used if axum's internal representation of path parameters
+    /// is missing. This is commonly caused by extracting `Request<_>`. `Path`
+    /// must be extracted first.
     pub struct MissingPathParams;
 }
 
 define_rejection! {
-    #[status = BAD_REQUEST]
-    #[body = "Form requests must have `Content-Type: x-www-form-urlencoded`"]
-    /// Rejection type used if you try and extract the request more than once.
+    #[status = UNSUPPORTED_MEDIA_TYPE]
+    #[body = "Form requests must have `Content-Type: application/x-www-form-urlencoded`"]
+    /// Rejection type for [`Form`](super::Form) or [`RawForm`](super::RawForm)
+    /// used if the `Content-Type` header is missing
+    /// or its value is not `application/x-www-form-urlencoded`.
     pub struct InvalidFormContentType;
 }
 
-/// Rejection type for extractors that deserialize query strings if the input
-/// couldn't be deserialized into the target type.
-#[derive(Debug)]
-pub struct FailedToDeserializeQueryString {
-    error: Error,
-    type_name: &'static str,
+define_rejection! {
+    #[status = BAD_REQUEST]
+    #[body = "Failed to deserialize form"]
+    /// Rejection type used if the [`Form`](super::Form) extractor is unable to
+    /// deserialize the form into the target type.
+    pub struct FailedToDeserializeForm(Error);
 }
 
-impl FailedToDeserializeQueryString {
-    pub(super) fn new<T, E>(error: E) -> Self
-    where
-        E: Into<BoxError>,
-    {
-        FailedToDeserializeQueryString {
-            error: Error::new(error),
-            type_name: std::any::type_name::<T>(),
-        }
-    }
+define_rejection! {
+    #[status = UNPROCESSABLE_ENTITY]
+    #[body = "Failed to deserialize form body"]
+    /// Rejection type used if the [`Form`](super::Form) extractor is unable to
+    /// deserialize the form body into the target type.
+    pub struct FailedToDeserializeFormBody(Error);
 }
 
-impl IntoResponse for FailedToDeserializeQueryString {
-    fn into_response(self) -> Response {
-        let mut res = Response::new(boxed(Full::from(self.to_string())));
-        *res.status_mut() = http::StatusCode::BAD_REQUEST;
-        res
-    }
+define_rejection! {
+    #[status = BAD_REQUEST]
+    #[body = "Failed to deserialize query string"]
+    /// Rejection type used if the [`Query`](super::Query) extractor is unable to
+    /// deserialize the query string into the target type.
+    pub struct FailedToDeserializeQueryString(Error);
 }
-
-impl std::fmt::Display for FailedToDeserializeQueryString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Failed to deserialize query string. Expected something of type `{}`. Error: {}",
-            self.type_name, self.error,
-        )
-    }
-}
-
-impl std::error::Error for FailedToDeserializeQueryString {}
 
 composite_rejection! {
     /// Rejection used for [`Query`](super::Query).
@@ -123,9 +106,20 @@ composite_rejection! {
     /// can fail.
     pub enum FormRejection {
         InvalidFormContentType,
-        FailedToDeserializeQueryString,
+        FailedToDeserializeForm,
+        FailedToDeserializeFormBody,
         BytesRejection,
-        HeadersAlreadyExtracted,
+    }
+}
+
+composite_rejection! {
+    /// Rejection used for [`RawForm`](super::RawForm).
+    ///
+    /// Contains one variant for each way the [`RawForm`](super::RawForm) extractor
+    /// can fail.
+    pub enum RawFormRejection {
+        InvalidFormContentType,
+        BytesRejection,
     }
 }
 
@@ -137,10 +131,10 @@ composite_rejection! {
     /// can fail.
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     pub enum JsonRejection {
-        InvalidJsonBody,
+        JsonDataError,
+        JsonSyntaxError,
         MissingJsonContentType,
         BytesRejection,
-        HeadersAlreadyExtracted,
     }
 }
 
@@ -151,7 +145,6 @@ composite_rejection! {
     /// can fail.
     pub enum ExtensionRejection {
         MissingExtension,
-        ExtensionsAlreadyExtracted,
     }
 }
 
@@ -166,82 +159,42 @@ composite_rejection! {
     }
 }
 
+composite_rejection! {
+    /// Rejection used for [`RawPathParams`](super::RawPathParams).
+    ///
+    /// Contains one variant for each way the [`RawPathParams`](super::RawPathParams) extractor
+    /// can fail.
+    pub enum RawPathParamsRejection {
+        InvalidUtf8InPathParam,
+        MissingPathParams,
+    }
+}
+
+#[cfg(feature = "matched-path")]
 define_rejection! {
     #[status = INTERNAL_SERVER_ERROR]
     #[body = "No matched path found"]
     /// Rejection if no matched path could be found.
     ///
     /// See [`MatchedPath`](super::MatchedPath) for more details.
+    #[cfg_attr(docsrs, doc(cfg(feature = "matched-path")))]
     pub struct MatchedPathMissing;
 }
 
+#[cfg(feature = "matched-path")]
 composite_rejection! {
     /// Rejection used for [`MatchedPath`](super::MatchedPath).
+    #[cfg_attr(docsrs, doc(cfg(feature = "matched-path")))]
     pub enum MatchedPathRejection {
-        ExtensionsAlreadyExtracted,
         MatchedPathMissing,
     }
 }
 
-/// Rejection used for [`ContentLengthLimit`](super::ContentLengthLimit).
-///
-/// Contains one variant for each way the
-/// [`ContentLengthLimit`](super::ContentLengthLimit) extractor can fail.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ContentLengthLimitRejection<T> {
-    #[allow(missing_docs)]
-    PayloadTooLarge(PayloadTooLarge),
-    #[allow(missing_docs)]
-    LengthRequired(LengthRequired),
-    #[allow(missing_docs)]
-    HeadersAlreadyExtracted(HeadersAlreadyExtracted),
-    #[allow(missing_docs)]
-    Inner(T),
+define_rejection! {
+    #[status = INTERNAL_SERVER_ERROR]
+    #[body = "The matched route is not nested"]
+    /// Rejection type for [`NestedPath`](super::NestedPath).
+    ///
+    /// This rejection is used if the matched route wasn't nested.
+    pub struct NestedPathRejection;
 }
-
-impl<T> IntoResponse for ContentLengthLimitRejection<T>
-where
-    T: IntoResponse,
-{
-    fn into_response(self) -> Response {
-        match self {
-            Self::PayloadTooLarge(inner) => inner.into_response(),
-            Self::LengthRequired(inner) => inner.into_response(),
-            Self::HeadersAlreadyExtracted(inner) => inner.into_response(),
-            Self::Inner(inner) => inner.into_response(),
-        }
-    }
-}
-
-impl<T> std::fmt::Display for ContentLengthLimitRejection<T>
-where
-    T: std::fmt::Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PayloadTooLarge(inner) => inner.fmt(f),
-            Self::LengthRequired(inner) => inner.fmt(f),
-            Self::HeadersAlreadyExtracted(inner) => inner.fmt(f),
-            Self::Inner(inner) => inner.fmt(f),
-        }
-    }
-}
-
-impl<T> std::error::Error for ContentLengthLimitRejection<T>
-where
-    T: std::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PayloadTooLarge(inner) => Some(inner),
-            Self::LengthRequired(inner) => Some(inner),
-            Self::HeadersAlreadyExtracted(inner) => Some(inner),
-            Self::Inner(inner) => Some(inner),
-        }
-    }
-}
-
-#[cfg(feature = "headers")]
-#[cfg_attr(docsrs, doc(cfg(feature = "headers")))]
-pub use super::typed_header::{TypedHeaderRejection, TypedHeaderRejectionReason};

@@ -4,33 +4,36 @@
 //! cargo test -p example-testing
 //! ```
 
+use std::net::SocketAddr;
+
 use axum::{
+    extract::ConnectInfo,
     routing::{get, post},
     Json, Router,
 };
 use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    // Set the RUST_LOG, if it hasn't been explicitly defined
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "example_testing=debug,tower_http=debug")
-    }
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
-
-    tracing::debug!("listening on {}", addr);
-
-    axum::Server::bind(&addr)
-        .serve(app().into_make_service())
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app()).await.unwrap();
 }
 
 /// Having a function that produces our app makes it easy to call it from tests
 /// without having to create an HTTP server.
-#[allow(dead_code)]
 fn app() -> Router {
     Router::new()
         .route("/", get(|| async { "Hello, World!" }))
@@ -39,6 +42,10 @@ fn app() -> Router {
             post(|payload: Json<serde_json::Value>| async move {
                 Json(serde_json::json!({ "data": payload.0 }))
             }),
+        )
+        .route(
+            "/requires-connect-info",
+            get(|ConnectInfo(addr): ConnectInfo<SocketAddr>| async move { format!("Hi {addr}") }),
         )
         // We can still add middleware
         .layer(TraceLayer::new_for_http())
@@ -49,11 +56,13 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
+        extract::connect_info::MockConnectInfo,
         http::{self, Request, StatusCode},
     };
+    use http_body_util::BodyExt; // for `collect`
     use serde_json::{json, Value};
-    use std::net::{SocketAddr, TcpListener};
-    use tower::ServiceExt; // for `app.oneshot()`
+    use tokio::net::TcpListener;
+    use tower::{Service, ServiceExt}; // for `call`, `oneshot`, and `ready`
 
     #[tokio::test]
     async fn hello_world() {
@@ -68,7 +77,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"Hello, World!");
     }
 
@@ -92,7 +101,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body, json!({ "data": [1, 2, 3, 4] }));
     }
@@ -112,37 +121,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
     }
 
     // You can also spawn a server and talk to it like any other HTTP server:
     #[tokio::test]
     async fn the_real_deal() {
-        let listener = TcpListener::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::Server::from_tcp(listener)
-                .unwrap()
-                .serve(app().into_make_service())
-                .await
-                .unwrap();
+            axum::serve(listener, app()).await.unwrap();
         });
 
-        let client = hyper::Client::new();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http();
 
         let response = client
             .request(
                 Request::builder()
-                    .uri(format!("http://{}", addr))
+                    .uri(format!("http://{addr}"))
+                    .header("Host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"Hello, World!");
+    }
+
+    // You can use `ready()` and `call()` to avoid using `clone()`
+    // in multiple request
+    #[tokio::test]
+    async fn multiple_request() {
+        let mut app = app().into_service();
+
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let response = ServiceExt::<Request<Body>>::ready(&mut app)
+            .await
+            .unwrap()
+            .call(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let response = ServiceExt::<Request<Body>>::ready(&mut app)
+            .await
+            .unwrap()
+            .call(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // Here we're calling `/requires-connect-info` which requires `ConnectInfo`
+    //
+    // That is normally set with `Router::into_make_service_with_connect_info` but we can't easily
+    // use that during tests. The solution is instead to set the `MockConnectInfo` layer during
+    // tests.
+    #[tokio::test]
+    async fn with_into_make_service_with_connect_info() {
+        let mut app = app()
+            .layer(MockConnectInfo(SocketAddr::from(([0, 0, 0, 0], 3000))))
+            .into_service();
+
+        let request = Request::builder()
+            .uri("/requires-connect-info")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
